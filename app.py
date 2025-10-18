@@ -267,7 +267,9 @@ async def telegram_webhook(request: Request):
 @app.get("/events")
 async def get_events(limit: int = 20):
     return {"events": recent_events[:limit]}
-    @app.get("/api/alerts")
+
+
+@app.get("/api/alerts")
 async def get_alerts():
     """Public endpoint for website to fetch alerts"""
     return {
@@ -279,6 +281,3 @@ async def get_alerts():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
