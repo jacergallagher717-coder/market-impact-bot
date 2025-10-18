@@ -267,6 +267,13 @@ async def telegram_webhook(request: Request):
 @app.get("/events")
 async def get_events(limit: int = 20):
     return {"events": recent_events[:limit]}
+    @app.get("/api/alerts")
+async def get_alerts():
+    """Public endpoint for website to fetch alerts"""
+    return {
+        "alerts": recent_events[:20],
+        "count": len(recent_events)
+    }
 
 
 if __name__ == "__main__":
