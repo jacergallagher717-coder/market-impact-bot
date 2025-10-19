@@ -1,5 +1,5 @@
 """
-Market Impact & Trade Ideas Backend with CNBC Auto-Monitoring
+Market Impact & Trade Ideas Backend with CNBC Auto-Monitoring (Fixed)
 """
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -282,57 +282,86 @@ async def process_news_item(headline: str, source: str):
 
 
 async def monitor_cnbc_rss():
-    """Monitor CNBC RSS feed for breaking news"""
+    """Monitor CNBC RSS feed for breaking news with proper headers"""
     global cnbc_monitor_running
     cnbc_monitor_running = True
     
     seen_headlines = set()
     
-    # CNBC Breaking News RSS Feed
-    RSS_URL = "https://www.cnbc.com/id/100003114/device/rss/rss.html"
+    # Multiple RSS feed options
+    RSS_FEEDS = [
+        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664",  # Top News
+        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069",  # Breaking News
+        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",  # US News
+    ]
     
-    print("🚀 Starting CNBC monitor...")
+    # Browser-like headers to avoid 403
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
+    }
+    
+    print("🚀 Starting CNBC monitor with multiple feeds...")
     
     while cnbc_monitor_running:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.get(RSS_URL)
-                response.raise_for_status()
-                
-                # Parse RSS XML
-                root = ET.fromstring(response.content)
-                
-                # Extract items from RSS feed
-                for item in root.findall('.//item'):
-                    title_elem = item.find('title')
-                    if title_elem is not None and title_elem.text:
-                        headline = title_elem.text.strip()
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                # Try each feed
+                for feed_url in RSS_FEEDS:
+                    try:
+                        response = await client.get(feed_url, headers=headers)
+                        response.raise_for_status()
                         
-                        # Skip if we've seen this headline
-                        if headline in seen_headlines:
-                            continue
+                        # Parse RSS XML
+                        root = ET.fromstring(response.content)
                         
-                        seen_headlines.add(headline)
+                        # Extract items from RSS feed (handle different RSS formats)
+                        items = root.findall('.//item') or root.findall('.//{http://search.cnbc.com/rs/search/combinedcms/view}item')
                         
-                        # Keep seen_headlines size manageable
-                        if len(seen_headlines) > 200:
-                            seen_headlines.pop()
+                        for item in items:
+                            title_elem = item.find('title') or item.find('{http://search.cnbc.com/rs/search/combinedcms/view}title')
+                            if title_elem is not None and title_elem.text:
+                                headline = title_elem.text.strip()
+                                
+                                # Skip if we've seen this headline
+                                if headline in seen_headlines:
+                                    continue
+                                
+                                seen_headlines.add(headline)
+                                
+                                # Keep seen_headlines size manageable
+                                if len(seen_headlines) > 200:
+                                    seen_headlines.pop()
+                                
+                                # Process the news
+                                await process_news_item(headline, "CNBC")
                         
-                        # Process the news
-                        await process_news_item(headline, "CNBC")
+                        # Successfully processed a feed, no need to try others
+                        break
+                        
+                    except httpx.HTTPStatusError as e:
+                        print(f"Feed {feed_url} returned {e.response.status_code}, trying next...")
+                        continue
+                    except Exception as e:
+                        print(f"Error with feed {feed_url}: {e}")
+                        continue
                 
         except Exception as e:
             print(f"CNBC monitor error: {e}")
         
-        # Check every 60 seconds
-        await asyncio.sleep(60)
+        # Check every 2 minutes (CNBC doesn't update that frequently)
+        await asyncio.sleep(120)
 
 
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks on startup"""
     asyncio.create_task(monitor_cnbc_rss())
-    print("✅ CNBC monitor started")
+    print("✅ CNBC monitor task started")
 
 
 @app.on_event("shutdown")
