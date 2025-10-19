@@ -1,8 +1,8 @@
 """
-Market Impact & Trade Ideas Backend
+Market Impact & Trade Ideas Backend with CNBC Auto-Monitoring
 """
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -11,6 +11,8 @@ from hashlib import sha256
 import httpx
 import os
 import json
+import asyncio
+import xml.etree.ElementTree as ET
 
 app = FastAPI(title="Market Impact API")
 
@@ -29,6 +31,7 @@ ANTHROPIC_MODEL = "claude-sonnet-4-5-20250929"
 
 seen_events = {}
 recent_events = []
+cnbc_monitor_running = False
 
 PLAYBOOK = {
     "soybeans": {
@@ -54,6 +57,30 @@ PLAYBOOK = {
         "tickers": ["CL", "XLE", "XOP", "XOM", "CVX"],
         "category": "commodity",
         "description": "Crude oil and energy markets"
+    },
+    "tech_earnings": {
+        "keywords": ["earnings", "revenue", "profit", "guidance", "quarterly", "beat", "miss"],
+        "tickers": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA"],
+        "category": "sector",
+        "description": "Tech earnings and guidance"
+    },
+    "fed_rates": {
+        "keywords": ["Federal Reserve", "Fed", "interest rate", "Powell", "FOMC", "inflation", "CPI"],
+        "tickers": ["TLT", "IEF", "GLD", "DXY", "SPY"],
+        "category": "macro",
+        "description": "Fed policy and rates"
+    },
+    "housing": {
+        "keywords": ["housing", "home sales", "mortgage", "real estate", "construction"],
+        "tickers": ["XHB", "ITB", "DHI", "LEN", "PHM"],
+        "category": "sector",
+        "description": "Housing and real estate"
+    },
+    "banks": {
+        "keywords": ["bank", "JPMorgan", "Wells Fargo", "Bank of America", "lending", "deposits"],
+        "tickers": ["JPM", "BAC", "WFC", "C", "GS", "MS", "XLF"],
+        "category": "sector",
+        "description": "Banking sector"
     }
 }
 
@@ -73,7 +100,8 @@ OUTPUT: Valid JSON matching this schema:
   "event": {{
     "headline": "concise headline",
     "category": "macro|commodity|sector",
-    "confidence": 0.0-1.0
+    "confidence": 0.0-1.0,
+    "detected_at": "ISO timestamp"
   }},
   "why_it_matters": ["point 1", "point 2", "point 3"],
   "affected_assets": [
@@ -166,7 +194,12 @@ def create_fallback_analysis(text: str) -> Dict[str, Any]:
     ticker = playbooks[0]["playbook"]["tickers"][0] if playbooks else "SPY"
     
     return {
-        "event": {"headline": text[:100], "category": "general", "confidence": 0.3},
+        "event": {
+            "headline": text[:100], 
+            "category": "general", 
+            "confidence": 0.3,
+            "detected_at": datetime.now().isoformat()
+        },
         "why_it_matters": ["News detected but analysis unavailable"],
         "affected_assets": [{"ticker": ticker, "direction": "neutral", "rationale": "Manual review needed"}],
         "trade_idea": {"ticker": ticker, "direction": "neutral", "strategy": "monitor", "rationale": "Await confirmation", "risk": "Unclear impact"}
@@ -213,9 +246,106 @@ _Not financial advice._"""
             return False
 
 
+async def process_news_item(headline: str, source: str):
+    """Process a single news item through the analysis pipeline"""
+    try:
+        event_hash = hash_event(headline)
+        if is_duplicate(event_hash):
+            return
+        
+        playbooks = find_relevant_playbooks(headline)
+        
+        # Only process if relevant to our playbooks
+        if not playbooks:
+            return
+        
+        playbook_context = "\n".join(
+            f"- {p['playbook']['description']}: {', '.join(p['playbook']['tickers'][:4])}"
+            for p in playbooks
+        )
+        
+        analysis = await call_anthropic_agent(headline, playbook_context)
+        analysis["event"]["source"] = source
+        analysis["event"]["detected_at"] = datetime.now().isoformat()
+        
+        recent_events.insert(0, analysis)
+        if len(recent_events) > 100:
+            recent_events.pop()
+        
+        # Send to Telegram if configured
+        await send_telegram_alert(analysis, source)
+        
+        print(f"✅ Processed {source} news: {headline[:60]}...")
+        
+    except Exception as e:
+        print(f"Error processing news: {e}")
+
+
+async def monitor_cnbc_rss():
+    """Monitor CNBC RSS feed for breaking news"""
+    global cnbc_monitor_running
+    cnbc_monitor_running = True
+    
+    seen_headlines = set()
+    
+    # CNBC Breaking News RSS Feed
+    RSS_URL = "https://www.cnbc.com/id/100003114/device/rss/rss.html"
+    
+    print("🚀 Starting CNBC monitor...")
+    
+    while cnbc_monitor_running:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(RSS_URL)
+                response.raise_for_status()
+                
+                # Parse RSS XML
+                root = ET.fromstring(response.content)
+                
+                # Extract items from RSS feed
+                for item in root.findall('.//item'):
+                    title_elem = item.find('title')
+                    if title_elem is not None and title_elem.text:
+                        headline = title_elem.text.strip()
+                        
+                        # Skip if we've seen this headline
+                        if headline in seen_headlines:
+                            continue
+                        
+                        seen_headlines.add(headline)
+                        
+                        # Keep seen_headlines size manageable
+                        if len(seen_headlines) > 200:
+                            seen_headlines.pop()
+                        
+                        # Process the news
+                        await process_news_item(headline, "CNBC")
+                
+        except Exception as e:
+            print(f"CNBC monitor error: {e}")
+        
+        # Check every 60 seconds
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks on startup"""
+    asyncio.create_task(monitor_cnbc_rss())
+    print("✅ CNBC monitor started")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    global cnbc_monitor_running
+    cnbc_monitor_running = False
+    print("⏹️  CNBC monitor stopped")
+
+
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Market Impact API"}
+    return {"status": "ok", "message": "Market Impact API with CNBC Auto-Monitoring"}
 
 
 @app.get("/health")
@@ -224,12 +354,15 @@ async def health():
         "status": "healthy",
         "telegram_configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
-        "events_processed": len(recent_events)
+        "cnbc_monitor_active": cnbc_monitor_running,
+        "events_processed": len(recent_events),
+        "alerts_available": len(recent_events)
     }
 
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request):
+    """Webhook for Telegram bot messages"""
     try:
         body = await request.json()
         message = body.get("message", {}) or body.get("channel_post", {})
@@ -238,34 +371,18 @@ async def telegram_webhook(request: Request):
         if not text or text.startswith("/"):
             return {"status": "ignored"}
         
-        event_hash = hash_event(text)
-        if is_duplicate(event_hash):
-            return {"status": "duplicate"}
+        await process_news_item(text, "telegram")
         
-        playbooks = find_relevant_playbooks(text)
-        playbook_context = "\n".join(
-            f"- {p['playbook']['description']}: {', '.join(p['playbook']['tickers'][:4])}"
-            for p in playbooks
-        )
-        
-        analysis = await call_anthropic_agent(text, playbook_context)
-        analysis["event"]["source"] = "telegram"
-        
-        recent_events.insert(0, analysis)
-        if len(recent_events) > 50:
-            recent_events.pop()
-        
-        await send_telegram_alert(analysis, "telegram")
-        
-        return {"status": "processed", "confidence": analysis["event"]["confidence"]}
+        return {"status": "processed"}
         
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Telegram webhook error: {e}")
         return {"status": "error", "message": str(e)}
 
 
 @app.get("/events")
 async def get_events(limit: int = 20):
+    """Get recent events (legacy endpoint)"""
     return {"events": recent_events[:limit]}
 
 
@@ -273,9 +390,16 @@ async def get_events(limit: int = 20):
 async def get_alerts():
     """Public endpoint for website to fetch alerts"""
     return {
-        "alerts": recent_events[:20],
+        "alerts": recent_events[:50],
         "count": len(recent_events)
     }
+
+
+@app.post("/api/test-alert")
+async def test_alert(news: NewsEvent):
+    """Manual endpoint to test with custom news"""
+    await process_news_item(news.text, news.source)
+    return {"status": "processed", "message": "Alert created"}
 
 
 if __name__ == "__main__":
