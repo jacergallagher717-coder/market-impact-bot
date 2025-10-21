@@ -1,5 +1,5 @@
 """
-Market Impact & Trade Ideas Backend with CNBC Auto-Monitoring (Fixed)
+Market Impact & Trade Ideas Backend with CNBC Auto-Monitoring (ALL NEWS VERSION)
 """
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -59,13 +59,13 @@ PLAYBOOK = {
         "description": "Crude oil and energy markets"
     },
     "tech_earnings": {
-        "keywords": ["earnings", "revenue", "profit", "guidance", "quarterly", "beat", "miss"],
-        "tickers": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA"],
+        "keywords": ["earnings", "revenue", "profit", "guidance", "quarterly", "beat", "miss", "Tesla", "Apple", "Microsoft", "Amazon", "Google", "Meta", "Netflix"],
+        "tickers": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NFLX"],
         "category": "sector",
         "description": "Tech earnings and guidance"
     },
     "fed_rates": {
-        "keywords": ["Federal Reserve", "Fed", "interest rate", "Powell", "FOMC", "inflation", "CPI"],
+        "keywords": ["Federal Reserve", "Fed", "interest rate", "Powell", "FOMC", "inflation", "CPI", "jobs report"],
         "tickers": ["TLT", "IEF", "GLD", "DXY", "SPY"],
         "category": "macro",
         "description": "Fed policy and rates"
@@ -81,6 +81,12 @@ PLAYBOOK = {
         "tickers": ["JPM", "BAC", "WFC", "C", "GS", "MS", "XLF"],
         "category": "sector",
         "description": "Banking sector"
+    },
+    "stock_market": {
+        "keywords": ["stock", "futures", "S&P", "Dow", "Nasdaq", "market", "rally", "selloff", "earnings week"],
+        "tickers": ["SPY", "QQQ", "DIA", "IWM", "VIX"],
+        "category": "macro",
+        "description": "General stock market movements"
     }
 }
 
@@ -247,22 +253,19 @@ _Not financial advice._"""
 
 
 async def process_news_item(headline: str, source: str):
-    """Process a single news item through the analysis pipeline"""
+    """Process a single news item through the analysis pipeline - ALL NEWS VERSION"""
     try:
         event_hash = hash_event(headline)
         if is_duplicate(event_hash):
             return
         
+        # Process ALL breaking news, not just playbook matches
         playbooks = find_relevant_playbooks(headline)
-        
-        # Only process if relevant to our playbooks
-        if not playbooks:
-            return
         
         playbook_context = "\n".join(
             f"- {p['playbook']['description']}: {', '.join(p['playbook']['tickers'][:4])}"
             for p in playbooks
-        )
+        ) if playbooks else "General market news - identify affected sectors and tickers from the headline"
         
         analysis = await call_anthropic_agent(headline, playbook_context)
         analysis["event"]["source"] = source
@@ -305,7 +308,7 @@ async def monitor_cnbc_rss():
         "Upgrade-Insecure-Requests": "1"
     }
     
-    print("🚀 Starting CNBC monitor with multiple feeds...")
+    print("🚀 Starting CNBC monitor - ALL breaking news will be processed...")
     
     while cnbc_monitor_running:
         try:
@@ -337,7 +340,7 @@ async def monitor_cnbc_rss():
                                 if len(seen_headlines) > 200:
                                     seen_headlines.pop()
                                 
-                                # Process the news
+                                # Process ALL news - no filtering
                                 await process_news_item(headline, "CNBC")
                         
                         # Successfully processed a feed, no need to try others
@@ -353,7 +356,7 @@ async def monitor_cnbc_rss():
         except Exception as e:
             print(f"CNBC monitor error: {e}")
         
-        # Check every 2 minutes (CNBC doesn't update that frequently)
+        # Check every 2 minutes
         await asyncio.sleep(120)
 
 
@@ -361,7 +364,7 @@ async def monitor_cnbc_rss():
 async def startup_event():
     """Start background tasks on startup"""
     asyncio.create_task(monitor_cnbc_rss())
-    print("✅ CNBC monitor task started")
+    print("✅ CNBC monitor task started - ALL BREAKING NEWS MODE")
 
 
 @app.on_event("shutdown")
@@ -374,7 +377,7 @@ async def shutdown_event():
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Market Impact API with CNBC Auto-Monitoring"}
+    return {"status": "ok", "message": "Market Impact API with CNBC Auto-Monitoring (ALL NEWS)"}
 
 
 @app.get("/health")
@@ -385,7 +388,8 @@ async def health():
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
         "cnbc_monitor_active": cnbc_monitor_running,
         "events_processed": len(recent_events),
-        "alerts_available": len(recent_events)
+        "alerts_available": len(recent_events),
+        "mode": "ALL_BREAKING_NEWS"
     }
 
 
