@@ -1,5 +1,5 @@
 """
-Market Impact & Trade Ideas Backend - POSTGRESQL + REAL-TIME DATA + MULTI-TRADE
+Market Impact & Trade Ideas Backend - POSTGRESQL (asyncpg) + REAL-TIME DATA + MULTI-TRADE
 """
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -13,9 +13,7 @@ import os
 import json
 import asyncio
 import xml.etree.ElementTree as ET
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from psycopg2.pool import SimpleConnectionPool
+import asyncpg
 from market_enricher import get_enriched_context
 
 app = FastAPI(title="Market Impact API")
@@ -39,6 +37,7 @@ MAX_ALERTS = 15
 # Database connection pool
 db_pool = None
 seen_events = {}
+recent_events = []
 cnbc_monitor_running = False
 
 PLAYBOOK = {
@@ -184,7 +183,7 @@ class NewsEvent(BaseModel):
 
 # ==================== DATABASE FUNCTIONS ====================
 
-def init_database():
+async def init_database():
     """Initialize database connection and create tables"""
     global db_pool
     
@@ -194,33 +193,27 @@ def init_database():
     
     try:
         # Create connection pool
-        db_pool = SimpleConnectionPool(1, 10, DATABASE_URL)
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         
         # Create tables
-        conn = db_pool.getconn()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS alerts (
-                id SERIAL PRIMARY KEY,
-                alert_data JSONB NOT NULL,
-                headline TEXT,
-                category TEXT,
-                source TEXT,
-                detected_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create index for faster queries
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_alerts_detected_at 
-            ON alerts(detected_at DESC)
-        """)
-        
-        conn.commit()
-        cursor.close()
-        db_pool.putconn(conn)
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id SERIAL PRIMARY KEY,
+                    alert_data JSONB NOT NULL,
+                    headline TEXT,
+                    category TEXT,
+                    source TEXT,
+                    detected_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create index for faster queries
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_alerts_detected_at 
+                ON alerts(detected_at DESC)
+            """)
         
         print("✅ Database initialized successfully")
         
@@ -229,57 +222,47 @@ def init_database():
         db_pool = None
 
 
-def save_alert_to_db(alert: Dict[str, Any]):
+async def save_alert_to_db(alert: Dict[str, Any]):
     """Save alert to PostgreSQL"""
     if not db_pool:
         return
     
     try:
-        conn = db_pool.getconn()
-        cursor = conn.cursor()
-        
         event = alert.get('event', {})
         
-        cursor.execute("""
-            INSERT INTO alerts (alert_data, headline, category, source, detected_at)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (
-            json.dumps(alert),
-            event.get('headline', ''),
-            event.get('category', 'general'),
-            event.get('source', 'unknown'),
-            event.get('detected_at', datetime.now().isoformat())
-        ))
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO alerts (alert_data, headline, category, source, detected_at)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 
+                json.dumps(alert),
+                event.get('headline', ''),
+                event.get('category', 'general'),
+                event.get('source', 'unknown'),
+                event.get('detected_at', datetime.now().isoformat())
+            )
         
-        conn.commit()
-        cursor.close()
-        db_pool.putconn(conn)
+        print(f"💾 Saved alert to database")
         
     except Exception as e:
         print(f"❌ Error saving alert to database: {e}")
 
 
-def load_alerts_from_db(limit: int = MAX_ALERTS) -> List[Dict[str, Any]]:
+async def load_alerts_from_db(limit: int = MAX_ALERTS) -> List[Dict[str, Any]]:
     """Load recent alerts from PostgreSQL"""
     if not db_pool:
         return []
     
     try:
-        conn = db_pool.getconn()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT alert_data 
+                FROM alerts 
+                ORDER BY detected_at DESC 
+                LIMIT $1
+            """, limit)
         
-        cursor.execute("""
-            SELECT alert_data 
-            FROM alerts 
-            ORDER BY detected_at DESC 
-            LIMIT %s
-        """, (limit,))
-        
-        rows = cursor.fetchall()
-        cursor.close()
-        db_pool.putconn(conn)
-        
-        alerts = [row['alert_data'] for row in rows]
+        alerts = [dict(row['alert_data']) for row in rows]
         print(f"📂 Loaded {len(alerts)} alerts from database")
         return alerts
         
@@ -288,24 +271,20 @@ def load_alerts_from_db(limit: int = MAX_ALERTS) -> List[Dict[str, Any]]:
         return []
 
 
-def cleanup_old_alerts():
+async def cleanup_old_alerts():
     """Remove alerts older than 7 days to keep database clean"""
     if not db_pool:
         return
     
     try:
-        conn = db_pool.getconn()
-        cursor = conn.cursor()
+        async with db_pool.acquire() as conn:
+            result = await conn.execute("""
+                DELETE FROM alerts 
+                WHERE detected_at < NOW() - INTERVAL '7 days'
+            """)
         
-        cursor.execute("""
-            DELETE FROM alerts 
-            WHERE detected_at < NOW() - INTERVAL '7 days'
-        """)
-        
-        deleted = cursor.rowcount
-        conn.commit()
-        cursor.close()
-        db_pool.putconn(conn)
+        # Extract number of deleted rows from result
+        deleted = int(result.split()[-1]) if result else 0
         
         if deleted > 0:
             print(f"🗑️  Cleaned up {deleted} old alerts from database")
@@ -314,7 +293,7 @@ def cleanup_old_alerts():
         print(f"❌ Error cleaning up old alerts: {e}")
 
 
-# ==================== EXISTING FUNCTIONS (Updated) ====================
+# ==================== EXISTING FUNCTIONS ====================
 
 def hash_event(text: str) -> str:
     return sha256(text.encode()).hexdigest()[:16]
@@ -498,13 +477,13 @@ async def process_news_item(headline: str, source: str):
         analysis["event"]["detected_at"] = datetime.now().isoformat()
         
         # Save to database
-        save_alert_to_db(analysis)
+        await save_alert_to_db(analysis)
         
         # Send to Telegram
         await send_telegram_alert(analysis, source)
         
         # Reload from database to keep in sync
-        recent_events = load_alerts_from_db(MAX_ALERTS)
+        recent_events = await load_alerts_from_db(MAX_ALERTS)
         
         print(f"✅ Processed {source} news: {headline[:60]}...")
         
@@ -575,13 +554,13 @@ async def startup_event():
     global recent_events
     
     # Initialize database
-    init_database()
+    await init_database()
     
     # Load existing alerts from database
-    recent_events = load_alerts_from_db(MAX_ALERTS)
+    recent_events = await load_alerts_from_db(MAX_ALERTS)
     
     # Clean up old alerts
-    cleanup_old_alerts()
+    await cleanup_old_alerts()
     
     # Start CNBC monitor
     asyncio.create_task(monitor_cnbc_rss())
@@ -594,7 +573,7 @@ async def shutdown_event():
     cnbc_monitor_running = False
     
     if db_pool:
-        db_pool.closeall()
+        await db_pool.close()
     
     print("⏹️  System shut down")
 
@@ -614,7 +593,7 @@ async def health():
         "cnbc_monitor_active": cnbc_monitor_running,
         "alerts_count": len(recent_events),
         "storage": "PostgreSQL" if db_pool else "In-Memory (No Persistence!)",
-        "mode": "POSTGRESQL_PERSISTENT_WITH_REALTIME_DATA"
+        "mode": "POSTGRESQL_ASYNCPG_WITH_REALTIME_DATA"
     }
 
 
