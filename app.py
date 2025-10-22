@@ -1,5 +1,5 @@
 """
-Market Impact & Trade Ideas Backend - MULTI-TRADE + PERSISTENT STORAGE
+Market Impact & Trade Ideas Backend - MULTI-TRADE + PERSISTENT STORAGE + REAL-TIME DATA
 """
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -223,7 +223,13 @@ async def call_anthropic_agent(news_text: str, playbook_context: str) -> Dict[st
     if not ANTHROPIC_API_KEY:
         return create_fallback_analysis(news_text)
     
-    system_prompt = AGENT_SYSTEM_PROMPT.format(playbook_context=playbook_context)
+    # NEW: Get enriched market data with real-time prices, news, and context
+    print("🔍 Fetching real-time market data...")
+    enriched_context = await get_enriched_context(news_text)
+    
+    # Build enhanced system prompt with real-time data
+    enhanced_playbook = f"{playbook_context}\n\n{enriched_context}"
+    system_prompt = AGENT_SYSTEM_PROMPT.format(playbook_context=enhanced_playbook)
     
     async with httpx.AsyncClient(timeout=45.0) as client:
         try:
@@ -251,6 +257,7 @@ async def call_anthropic_agent(news_text: str, playbook_context: str) -> Dict[st
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0]
             
+            print("✅ Analysis complete with real-time data")
             return json.loads(content.strip())
             
         except Exception as e:
@@ -480,7 +487,7 @@ async def health():
         "cnbc_monitor_active": cnbc_monitor_running,
         "alerts_count": len(recent_events),
         "max_alerts": MAX_ALERTS,
-        "mode": "PERSISTENT_15_ALERTS"
+        "mode": "PERSISTENT_15_ALERTS_WITH_REALTIME_DATA"
     }
 
 
