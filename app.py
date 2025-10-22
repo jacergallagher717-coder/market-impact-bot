@@ -352,6 +352,7 @@ _Not financial advice._"""
 
 async def process_news_item(headline: str, source: str):
     """Process news and maintain 15-alert limit with FIFO"""
+    global recent_events
     try:
         event_hash = hash_event(headline)
         if is_duplicate(event_hash):
