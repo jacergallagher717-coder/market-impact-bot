@@ -1,5 +1,5 @@
 """
-Market Impact & Trade Ideas Backend - MULTI-TRADE + PERSISTENT STORAGE + REAL-TIME DATA
+Market Impact & Trade Ideas Backend - POSTGRESQL + REAL-TIME DATA + MULTI-TRADE
 """
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -13,7 +13,9 @@ import os
 import json
 import asyncio
 import xml.etree.ElementTree as ET
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2.pool import SimpleConnectionPool
 from market_enricher import get_enriched_context
 
 app = FastAPI(title="Market Impact API")
@@ -30,13 +32,13 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = "claude-sonnet-4-5-20250929"
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Persistent storage file
-STORAGE_FILE = Path("/tmp/market_alerts.json")
 MAX_ALERTS = 15
 
+# Database connection pool
+db_pool = None
 seen_events = {}
-recent_events = []
 cnbc_monitor_running = False
 
 PLAYBOOK = {
@@ -123,7 +125,12 @@ OUTPUT: Valid JSON matching this schema:
       "direction": "bullish|bearish",
       "strategy": "shares|calls|puts|spread",
       "rationale": "why this specific trade",
-      "conviction": "high|medium|low"
+      "conviction": "high|medium|low",
+      "entry_price": "specific entry price or range like '245-248'",
+      "target_price": "price target like '275'",
+      "stop_loss": "stop loss price like '235'",
+      "time_horizon": "holding period like '2-4 weeks' or '1-3 months'",
+      "risk_reward_ratio": "ratio like '1:3' or '1:2.5'"
     }}
   ],
   "scenarios": {{
@@ -151,12 +158,21 @@ OUTPUT: Valid JSON matching this schema:
   }}
 }}
 
+CRITICAL TRADING PARAMETERS:
+- Use REAL-TIME DATA provided to calculate accurate entry/exit prices
+- Entry price should be near current price (within 2-5% for shares, 10-15% for options)
+- Target price should be realistic based on technical levels and fundamentals
+- Stop loss should limit risk to 3-8% for shares, 25-50% for options
+- Risk/reward ratio should be at least 1:2 (risk $1 to make $2+)
+- Time horizon should match catalyst timing (earnings = 2-4 weeks, macro = 2-6 months)
+
 IMPORTANT: 
 - Generate 3-5 trade ideas ALL IN THE SAME DIRECTION (all bullish OR all bearish)
 - Each trade idea should be a DIFFERENT ticker with unique rationale
 - If news is bullish for sector, give multiple bullish stock ideas in that sector
 - If news is bearish, give multiple bearish plays (puts, shorts, inverse ETFs)
 - Order trade ideas by conviction (highest first)
+- ALWAYS include specific entry, target, and stop loss prices using real-time data
 
 Output ONLY valid JSON."""
 
@@ -166,32 +182,139 @@ class NewsEvent(BaseModel):
     source: str
 
 
-def load_alerts_from_storage():
-    """Load alerts from persistent storage"""
-    global recent_events
+# ==================== DATABASE FUNCTIONS ====================
+
+def init_database():
+    """Initialize database connection and create tables"""
+    global db_pool
+    
+    if not DATABASE_URL:
+        print("⚠️  No DATABASE_URL found, running without persistence")
+        return
+    
     try:
-        if STORAGE_FILE.exists():
-            with open(STORAGE_FILE, 'r') as f:
-                data = json.load(f)
-                recent_events = data.get('alerts', [])
-                print(f"📂 Loaded {len(recent_events)} alerts from storage")
-        else:
-            recent_events = []
-            print("📂 No existing alerts found, starting fresh")
+        # Create connection pool
+        db_pool = SimpleConnectionPool(1, 10, DATABASE_URL)
+        
+        # Create tables
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id SERIAL PRIMARY KEY,
+                alert_data JSONB NOT NULL,
+                headline TEXT,
+                category TEXT,
+                source TEXT,
+                detected_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create index for faster queries
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_alerts_detected_at 
+            ON alerts(detected_at DESC)
+        """)
+        
+        conn.commit()
+        cursor.close()
+        db_pool.putconn(conn)
+        
+        print("✅ Database initialized successfully")
+        
     except Exception as e:
-        print(f"❌ Error loading alerts: {e}")
-        recent_events = []
+        print(f"❌ Database initialization error: {e}")
+        db_pool = None
 
 
-def save_alerts_to_storage():
-    """Save alerts to persistent storage"""
+def save_alert_to_db(alert: Dict[str, Any]):
+    """Save alert to PostgreSQL"""
+    if not db_pool:
+        return
+    
     try:
-        with open(STORAGE_FILE, 'w') as f:
-            json.dump({'alerts': recent_events[:MAX_ALERTS]}, f)
-        print(f"💾 Saved {len(recent_events)} alerts to storage")
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        
+        event = alert.get('event', {})
+        
+        cursor.execute("""
+            INSERT INTO alerts (alert_data, headline, category, source, detected_at)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (
+            json.dumps(alert),
+            event.get('headline', ''),
+            event.get('category', 'general'),
+            event.get('source', 'unknown'),
+            event.get('detected_at', datetime.now().isoformat())
+        ))
+        
+        conn.commit()
+        cursor.close()
+        db_pool.putconn(conn)
+        
     except Exception as e:
-        print(f"❌ Error saving alerts: {e}")
+        print(f"❌ Error saving alert to database: {e}")
 
+
+def load_alerts_from_db(limit: int = MAX_ALERTS) -> List[Dict[str, Any]]:
+    """Load recent alerts from PostgreSQL"""
+    if not db_pool:
+        return []
+    
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cursor.execute("""
+            SELECT alert_data 
+            FROM alerts 
+            ORDER BY detected_at DESC 
+            LIMIT %s
+        """, (limit,))
+        
+        rows = cursor.fetchall()
+        cursor.close()
+        db_pool.putconn(conn)
+        
+        alerts = [row['alert_data'] for row in rows]
+        print(f"📂 Loaded {len(alerts)} alerts from database")
+        return alerts
+        
+    except Exception as e:
+        print(f"❌ Error loading alerts from database: {e}")
+        return []
+
+
+def cleanup_old_alerts():
+    """Remove alerts older than 7 days to keep database clean"""
+    if not db_pool:
+        return
+    
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            DELETE FROM alerts 
+            WHERE detected_at < NOW() - INTERVAL '7 days'
+        """)
+        
+        deleted = cursor.rowcount
+        conn.commit()
+        cursor.close()
+        db_pool.putconn(conn)
+        
+        if deleted > 0:
+            print(f"🗑️  Cleaned up {deleted} old alerts from database")
+        
+    except Exception as e:
+        print(f"❌ Error cleaning up old alerts: {e}")
+
+
+# ==================== EXISTING FUNCTIONS (Updated) ====================
 
 def hash_event(text: str) -> str:
     return sha256(text.encode()).hexdigest()[:16]
@@ -223,7 +346,7 @@ async def call_anthropic_agent(news_text: str, playbook_context: str) -> Dict[st
     if not ANTHROPIC_API_KEY:
         return create_fallback_analysis(news_text)
     
-    # NEW: Get enriched market data with real-time prices, news, and context
+    # Get enriched market data with real-time prices, news, and context
     print("🔍 Fetching real-time market data...")
     enriched_context = await get_enriched_context(news_text)
     
@@ -284,7 +407,12 @@ def create_fallback_analysis(text: str) -> Dict[str, Any]:
                 "direction": "neutral",
                 "strategy": "monitor",
                 "rationale": "Await confirmation and full analysis",
-                "conviction": "low"
+                "conviction": "low",
+                "entry_price": "TBD",
+                "target_price": "TBD",
+                "stop_loss": "TBD",
+                "time_horizon": "N/A",
+                "risk_reward_ratio": "N/A"
             }
         ],
         "scenarios": {
@@ -351,7 +479,7 @@ _Not financial advice._"""
 
 
 async def process_news_item(headline: str, source: str):
-    """Process news and maintain 15-alert limit with FIFO"""
+    """Process news and save to database"""
     global recent_events
     try:
         event_hash = hash_event(headline)
@@ -369,21 +497,16 @@ async def process_news_item(headline: str, source: str):
         analysis["event"]["source"] = source
         analysis["event"]["detected_at"] = datetime.now().isoformat()
         
-        # Add to front of list
-        recent_events.insert(0, analysis)
+        # Save to database
+        save_alert_to_db(analysis)
         
-        # Keep only MAX_ALERTS (15), oldest ones get pushed out
-        if len(recent_events) > MAX_ALERTS:
-            removed = recent_events[MAX_ALERTS:]
-            recent_events = recent_events[:MAX_ALERTS]
-            print(f"🗑️  Removed {len(removed)} oldest alert(s) to maintain {MAX_ALERTS} limit")
-        
-        # Save to persistent storage
-        save_alerts_to_storage()
-        
+        # Send to Telegram
         await send_telegram_alert(analysis, source)
         
-        print(f"✅ Processed {source} news ({len(recent_events)}/{MAX_ALERTS} alerts): {headline[:60]}...")
+        # Reload from database to keep in sync
+        recent_events = load_alerts_from_db(MAX_ALERTS)
+        
+        print(f"✅ Processed {source} news: {headline[:60]}...")
         
     except Exception as e:
         print(f"Error processing news: {e}")
@@ -403,15 +526,11 @@ async def monitor_cnbc_rss():
     ]
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/rss+xml, application/xml, text/xml, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1"
     }
     
-    print(f"🚀 Starting CNBC monitor - Maintaining {MAX_ALERTS} alerts at all times...")
+    print(f"🚀 Starting CNBC monitor - Alerts persist in PostgreSQL...")
     
     while cnbc_monitor_running:
         try:
@@ -422,10 +541,10 @@ async def monitor_cnbc_rss():
                         response.raise_for_status()
                         
                         root = ET.fromstring(response.content)
-                        items = root.findall('.//item') or root.findall('.//{http://search.cnbc.com/rs/search/combinedcms/view}item')
+                        items = root.findall('.//item')
                         
                         for item in items:
-                            title_elem = item.find('title') or item.find('{http://search.cnbc.com/rs/search/combinedcms/view}title')
+                            title_elem = item.find('title')
                             if title_elem is not None and title_elem.text:
                                 headline = title_elem.text.strip()
                                 
@@ -441,11 +560,8 @@ async def monitor_cnbc_rss():
                         
                         break
                         
-                    except httpx.HTTPStatusError as e:
-                        print(f"Feed returned {e.response.status_code}, trying next...")
-                        continue
                     except Exception as e:
-                        print(f"Error with feed: {e}")
+                        print(f"Feed error: {e}")
                         continue
                 
         except Exception as e:
@@ -456,27 +572,36 @@ async def monitor_cnbc_rss():
 
 @app.on_event("startup")
 async def startup_event():
-    # Load existing alerts from storage first
-    load_alerts_from_storage()
+    global recent_events
     
-    # Then start the monitor
+    # Initialize database
+    init_database()
+    
+    # Load existing alerts from database
+    recent_events = load_alerts_from_db(MAX_ALERTS)
+    
+    # Clean up old alerts
+    cleanup_old_alerts()
+    
+    # Start CNBC monitor
     asyncio.create_task(monitor_cnbc_rss())
-    print(f"✅ CNBC monitor started - {len(recent_events)}/{MAX_ALERTS} alerts loaded")
+    print(f"✅ System started - {len(recent_events)} alerts loaded from PostgreSQL")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global cnbc_monitor_running
+    global cnbc_monitor_running, db_pool
     cnbc_monitor_running = False
     
-    # Save alerts before shutdown
-    save_alerts_to_storage()
-    print("⏹️  CNBC monitor stopped, alerts saved")
+    if db_pool:
+        db_pool.closeall()
+    
+    print("⏹️  System shut down")
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": f"Market Impact API - {len(recent_events)}/{MAX_ALERTS} alerts"}
+    return {"status": "ok", "message": f"Market Impact API - {len(recent_events)} alerts in database"}
 
 
 @app.get("/health")
@@ -485,10 +610,11 @@ async def health():
         "status": "healthy",
         "telegram_configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
+        "database_configured": bool(db_pool),
         "cnbc_monitor_active": cnbc_monitor_running,
         "alerts_count": len(recent_events),
-        "max_alerts": MAX_ALERTS,
-        "mode": "PERSISTENT_15_ALERTS_WITH_REALTIME_DATA"
+        "storage": "PostgreSQL" if db_pool else "In-Memory (No Persistence!)",
+        "mode": "POSTGRESQL_PERSISTENT_WITH_REALTIME_DATA"
     }
 
 
@@ -521,14 +647,14 @@ async def get_alerts():
     return {
         "alerts": recent_events,
         "count": len(recent_events),
-        "max": MAX_ALERTS
+        "storage": "PostgreSQL" if db_pool else "In-Memory"
     }
 
 
 @app.post("/api/test-alert")
 async def test_alert(news: NewsEvent):
     await process_news_item(news.text, news.source)
-    return {"status": "processed", "message": f"Alert created ({len(recent_events)}/{MAX_ALERTS} total)"}
+    return {"status": "processed", "message": f"Alert saved to database"}
 
 
 if __name__ == "__main__":
