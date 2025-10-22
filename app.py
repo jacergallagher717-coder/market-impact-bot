@@ -14,6 +14,7 @@ import json
 import asyncio
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from market_enricher import get_enriched_context
 
 app = FastAPI(title="Market Impact API")
 
