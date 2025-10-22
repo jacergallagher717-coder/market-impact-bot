@@ -1,5 +1,5 @@
 """
-Market Impact & Trade Ideas Backend with CNBC Auto-Monitoring (ALL NEWS VERSION)
+Market Impact & Trade Ideas Backend - MULTI-TRADE + PERSISTENT STORAGE
 """
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -13,6 +13,7 @@ import os
 import json
 import asyncio
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 app = FastAPI(title="Market Impact API")
 
@@ -28,6 +29,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = "claude-sonnet-4-5-20250929"
+
+# Persistent storage file
+STORAGE_FILE = Path("/tmp/market_alerts.json")
+MAX_ALERTS = 15
 
 seen_events = {}
 recent_events = []
@@ -93,10 +98,10 @@ PLAYBOOK = {
 AGENT_SYSTEM_PROMPT = """You are a real-time market impact analyst and trade ideation engine.
 
 Given breaking news, you must:
-1. Classify the event type
-2. Explain why it matters (3-5 bullet points)
-3. List affected assets with direction and time horizon
-4. Propose 1-2 risk-aware trade ideas
+1. Determine the PRIMARY market direction (bullish or bearish)
+2. Generate 3-5 SPECIFIC trade ideas in that SAME direction with different tickers
+3. Explain why it matters (3-5 bullet points)
+4. Provide bull/bear/base case scenarios with affected assets
 
 PLAYBOOK KNOWLEDGE:
 {playbook_context}
@@ -107,20 +112,50 @@ OUTPUT: Valid JSON matching this schema:
     "headline": "concise headline",
     "category": "macro|commodity|sector",
     "confidence": 0.0-1.0,
-    "detected_at": "ISO timestamp"
+    "detected_at": "ISO timestamp",
+    "primary_direction": "bullish|bearish"
   }},
   "why_it_matters": ["point 1", "point 2", "point 3"],
-  "affected_assets": [
-    {{"ticker": "SYMBOL", "direction": "up|down", "rationale": "brief reason"}}
+  "trade_ideas": [
+    {{
+      "ticker": "SYMBOL",
+      "direction": "bullish|bearish",
+      "strategy": "shares|calls|puts|spread",
+      "rationale": "why this specific trade",
+      "conviction": "high|medium|low"
+    }}
   ],
-  "trade_idea": {{
-    "ticker": "SYMBOL",
-    "direction": "bullish|bearish",
-    "strategy": "shares|calls|puts|spread",
-    "rationale": "why this trade makes sense",
-    "risk": "main risk factor"
+  "scenarios": {{
+    "bull_case": {{
+      "description": "What happens in best case scenario",
+      "probability": "percentage like 30%",
+      "affected_assets": [
+        {{"ticker": "SYMBOL", "impact": "up|down", "magnitude": "strong|moderate|weak"}}
+      ]
+    }},
+    "bear_case": {{
+      "description": "What happens in worst case scenario",
+      "probability": "percentage like 20%",
+      "affected_assets": [
+        {{"ticker": "SYMBOL", "impact": "up|down", "magnitude": "strong|moderate|weak"}}
+      ]
+    }},
+    "base_case": {{
+      "description": "Most likely outcome",
+      "probability": "percentage like 50%",
+      "affected_assets": [
+        {{"ticker": "SYMBOL", "impact": "up|down", "magnitude": "strong|moderate|weak"}}
+      ]
+    }}
   }}
 }}
+
+IMPORTANT: 
+- Generate 3-5 trade ideas ALL IN THE SAME DIRECTION (all bullish OR all bearish)
+- Each trade idea should be a DIFFERENT ticker with unique rationale
+- If news is bullish for sector, give multiple bullish stock ideas in that sector
+- If news is bearish, give multiple bearish plays (puts, shorts, inverse ETFs)
+- Order trade ideas by conviction (highest first)
 
 Output ONLY valid JSON."""
 
@@ -128,6 +163,33 @@ Output ONLY valid JSON."""
 class NewsEvent(BaseModel):
     text: str
     source: str
+
+
+def load_alerts_from_storage():
+    """Load alerts from persistent storage"""
+    global recent_events
+    try:
+        if STORAGE_FILE.exists():
+            with open(STORAGE_FILE, 'r') as f:
+                data = json.load(f)
+                recent_events = data.get('alerts', [])
+                print(f"📂 Loaded {len(recent_events)} alerts from storage")
+        else:
+            recent_events = []
+            print("📂 No existing alerts found, starting fresh")
+    except Exception as e:
+        print(f"❌ Error loading alerts: {e}")
+        recent_events = []
+
+
+def save_alerts_to_storage():
+    """Save alerts to persistent storage"""
+    try:
+        with open(STORAGE_FILE, 'w') as f:
+            json.dump({'alerts': recent_events[:MAX_ALERTS]}, f)
+        print(f"💾 Saved {len(recent_events)} alerts to storage")
+    except Exception as e:
+        print(f"❌ Error saving alerts: {e}")
 
 
 def hash_event(text: str) -> str:
@@ -162,7 +224,7 @@ async def call_anthropic_agent(news_text: str, playbook_context: str) -> Dict[st
     
     system_prompt = AGENT_SYSTEM_PROMPT.format(playbook_context=playbook_context)
     
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=45.0) as client:
         try:
             response = await client.post(
                 "https://api.anthropic.com/v1/messages",
@@ -173,9 +235,9 @@ async def call_anthropic_agent(news_text: str, playbook_context: str) -> Dict[st
                 },
                 json={
                     "model": ANTHROPIC_MODEL,
-                    "max_tokens": 2048,
+                    "max_tokens": 4096,
                     "system": system_prompt,
-                    "messages": [{"role": "user", "content": f"Analyze: {news_text}"}]
+                    "messages": [{"role": "user", "content": f"Analyze this breaking news and provide multiple trade ideas in the same direction: {news_text}"}]
                 }
             )
             response.raise_for_status()
@@ -204,11 +266,36 @@ def create_fallback_analysis(text: str) -> Dict[str, Any]:
             "headline": text[:100], 
             "category": "general", 
             "confidence": 0.3,
-            "detected_at": datetime.now().isoformat()
+            "detected_at": datetime.now().isoformat(),
+            "primary_direction": "neutral"
         },
-        "why_it_matters": ["News detected but analysis unavailable"],
-        "affected_assets": [{"ticker": ticker, "direction": "neutral", "rationale": "Manual review needed"}],
-        "trade_idea": {"ticker": ticker, "direction": "neutral", "strategy": "monitor", "rationale": "Await confirmation", "risk": "Unclear impact"}
+        "why_it_matters": ["News detected but full analysis unavailable"],
+        "trade_ideas": [
+            {
+                "ticker": ticker,
+                "direction": "neutral",
+                "strategy": "monitor",
+                "rationale": "Await confirmation and full analysis",
+                "conviction": "low"
+            }
+        ],
+        "scenarios": {
+            "bull_case": {
+                "description": "Positive interpretation of news",
+                "probability": "33%",
+                "affected_assets": [{"ticker": ticker, "impact": "up", "magnitude": "moderate"}]
+            },
+            "bear_case": {
+                "description": "Negative interpretation of news",
+                "probability": "33%",
+                "affected_assets": [{"ticker": ticker, "impact": "down", "magnitude": "moderate"}]
+            },
+            "base_case": {
+                "description": "Neutral market reaction",
+                "probability": "34%",
+                "affected_assets": [{"ticker": ticker, "impact": "neutral", "magnitude": "weak"}]
+            }
+        }
     }
 
 
@@ -217,21 +304,24 @@ async def send_telegram_alert(analysis: Dict[str, Any], source: str) -> bool:
         return False
     
     event = analysis["event"]
-    trade = analysis.get("trade_idea", {})
+    trade_ideas = analysis.get("trade_ideas", [])
+    
+    trade_list = "\n".join([
+        f"{i+1}. {t['ticker']} - {t['strategy'].upper()} ({t['conviction']})"
+        for i, t in enumerate(trade_ideas[:3])
+    ])
     
     message = f"""🚨 *Market Alert* ({source})
 
 {event['headline']}
 
+*Direction:* {event.get('primary_direction', 'neutral').upper()}
+
+*Top Trade Ideas:*
+{trade_list}
+
 *Why It Matters:*
 {chr(10).join(f"• {b}" for b in analysis['why_it_matters'][:3])}
-
-*Trade Idea:*
-{trade.get('ticker', 'N/A')} - {trade.get('direction', 'N/A').upper()}
-Strategy: {trade.get('strategy', 'monitor')}
-{trade.get('rationale', '')}
-
-⚠️ Risk: {trade.get('risk', 'See full analysis')}
 
 Confidence: {int(event.get('confidence', 0) * 100)}%
 
@@ -253,52 +343,56 @@ _Not financial advice._"""
 
 
 async def process_news_item(headline: str, source: str):
-    """Process a single news item through the analysis pipeline - ALL NEWS VERSION"""
+    """Process news and maintain 15-alert limit with FIFO"""
     try:
         event_hash = hash_event(headline)
         if is_duplicate(event_hash):
             return
         
-        # Process ALL breaking news, not just playbook matches
         playbooks = find_relevant_playbooks(headline)
         
         playbook_context = "\n".join(
-            f"- {p['playbook']['description']}: {', '.join(p['playbook']['tickers'][:4])}"
+            f"- {p['playbook']['description']}: {', '.join(p['playbook']['tickers'][:6])}"
             for p in playbooks
-        ) if playbooks else "General market news - identify affected sectors and tickers from the headline"
+        ) if playbooks else "General market news - identify multiple trade opportunities in the same direction"
         
         analysis = await call_anthropic_agent(headline, playbook_context)
         analysis["event"]["source"] = source
         analysis["event"]["detected_at"] = datetime.now().isoformat()
         
+        # Add to front of list
         recent_events.insert(0, analysis)
-        if len(recent_events) > 100:
-            recent_events.pop()
         
-        # Send to Telegram if configured
+        # Keep only MAX_ALERTS (15), oldest ones get pushed out
+        if len(recent_events) > MAX_ALERTS:
+            removed = recent_events[MAX_ALERTS:]
+            recent_events = recent_events[:MAX_ALERTS]
+            print(f"🗑️  Removed {len(removed)} oldest alert(s) to maintain {MAX_ALERTS} limit")
+        
+        # Save to persistent storage
+        save_alerts_to_storage()
+        
         await send_telegram_alert(analysis, source)
         
-        print(f"✅ Processed {source} news: {headline[:60]}...")
+        print(f"✅ Processed {source} news ({len(recent_events)}/{MAX_ALERTS} alerts): {headline[:60]}...")
         
     except Exception as e:
         print(f"Error processing news: {e}")
 
 
 async def monitor_cnbc_rss():
-    """Monitor CNBC RSS feed for breaking news with proper headers"""
+    """Monitor CNBC RSS feed for breaking news"""
     global cnbc_monitor_running
     cnbc_monitor_running = True
     
     seen_headlines = set()
     
-    # Multiple RSS feed options
     RSS_FEEDS = [
-        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664",  # Top News
-        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069",  # Breaking News
-        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",  # US News
+        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664",
+        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069",
+        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",
     ]
     
-    # Browser-like headers to avoid 403
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/rss+xml, application/xml, text/xml, */*",
@@ -308,21 +402,17 @@ async def monitor_cnbc_rss():
         "Upgrade-Insecure-Requests": "1"
     }
     
-    print("🚀 Starting CNBC monitor - ALL breaking news will be processed...")
+    print(f"🚀 Starting CNBC monitor - Maintaining {MAX_ALERTS} alerts at all times...")
     
     while cnbc_monitor_running:
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-                # Try each feed
                 for feed_url in RSS_FEEDS:
                     try:
                         response = await client.get(feed_url, headers=headers)
                         response.raise_for_status()
                         
-                        # Parse RSS XML
                         root = ET.fromstring(response.content)
-                        
-                        # Extract items from RSS feed (handle different RSS formats)
                         items = root.findall('.//item') or root.findall('.//{http://search.cnbc.com/rs/search/combinedcms/view}item')
                         
                         for item in items:
@@ -330,54 +420,54 @@ async def monitor_cnbc_rss():
                             if title_elem is not None and title_elem.text:
                                 headline = title_elem.text.strip()
                                 
-                                # Skip if we've seen this headline
                                 if headline in seen_headlines:
                                     continue
                                 
                                 seen_headlines.add(headline)
                                 
-                                # Keep seen_headlines size manageable
                                 if len(seen_headlines) > 200:
                                     seen_headlines.pop()
                                 
-                                # Process ALL news - no filtering
                                 await process_news_item(headline, "CNBC")
                         
-                        # Successfully processed a feed, no need to try others
                         break
                         
                     except httpx.HTTPStatusError as e:
-                        print(f"Feed {feed_url} returned {e.response.status_code}, trying next...")
+                        print(f"Feed returned {e.response.status_code}, trying next...")
                         continue
                     except Exception as e:
-                        print(f"Error with feed {feed_url}: {e}")
+                        print(f"Error with feed: {e}")
                         continue
                 
         except Exception as e:
             print(f"CNBC monitor error: {e}")
         
-        # Check every 2 minutes
         await asyncio.sleep(120)
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Start background tasks on startup"""
+    # Load existing alerts from storage first
+    load_alerts_from_storage()
+    
+    # Then start the monitor
     asyncio.create_task(monitor_cnbc_rss())
-    print("✅ CNBC monitor task started - ALL BREAKING NEWS MODE")
+    print(f"✅ CNBC monitor started - {len(recent_events)}/{MAX_ALERTS} alerts loaded")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on shutdown"""
     global cnbc_monitor_running
     cnbc_monitor_running = False
-    print("⏹️  CNBC monitor stopped")
+    
+    # Save alerts before shutdown
+    save_alerts_to_storage()
+    print("⏹️  CNBC monitor stopped, alerts saved")
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Market Impact API with CNBC Auto-Monitoring (ALL NEWS)"}
+    return {"status": "ok", "message": f"Market Impact API - {len(recent_events)}/{MAX_ALERTS} alerts"}
 
 
 @app.get("/health")
@@ -387,15 +477,14 @@ async def health():
         "telegram_configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
         "cnbc_monitor_active": cnbc_monitor_running,
-        "events_processed": len(recent_events),
-        "alerts_available": len(recent_events),
-        "mode": "ALL_BREAKING_NEWS"
+        "alerts_count": len(recent_events),
+        "max_alerts": MAX_ALERTS,
+        "mode": "PERSISTENT_15_ALERTS"
     }
 
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request):
-    """Webhook for Telegram bot messages"""
     try:
         body = await request.json()
         message = body.get("message", {}) or body.get("channel_post", {})
@@ -415,24 +504,22 @@ async def telegram_webhook(request: Request):
 
 @app.get("/events")
 async def get_events(limit: int = 20):
-    """Get recent events (legacy endpoint)"""
     return {"events": recent_events[:limit]}
 
 
 @app.get("/api/alerts")
 async def get_alerts():
-    """Public endpoint for website to fetch alerts"""
     return {
-        "alerts": recent_events[:50],
-        "count": len(recent_events)
+        "alerts": recent_events,
+        "count": len(recent_events),
+        "max": MAX_ALERTS
     }
 
 
 @app.post("/api/test-alert")
 async def test_alert(news: NewsEvent):
-    """Manual endpoint to test with custom news"""
     await process_news_item(news.text, news.source)
-    return {"status": "processed", "message": "Alert created"}
+    return {"status": "processed", "message": f"Alert created ({len(recent_events)}/{MAX_ALERTS} total)"}
 
 
 if __name__ == "__main__":
