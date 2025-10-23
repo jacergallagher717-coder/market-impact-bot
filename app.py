@@ -1,5 +1,5 @@
 """
-Market Impact & Trade Ideas Backend - POSTGRESQL (asyncpg) + REAL-TIME DATA + MULTI-TRADE
+Market Impact & Trade Ideas Backend - SUPABASE POSTGRESQL + REAL-TIME DATA
 """
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -13,7 +13,9 @@ import os
 import json
 import asyncio
 import xml.etree.ElementTree as ET
-import asyncpg
+import psycopg2
+from psycopg2.extras import RealDictCursor, Json
+from psycopg2.pool import SimpleConnectionPool
 from market_enricher import get_enriched_context
 
 app = FastAPI(title="Market Impact API")
@@ -183,7 +185,7 @@ class NewsEvent(BaseModel):
 
 # ==================== DATABASE FUNCTIONS ====================
 
-async def init_database():
+def init_database():
     """Initialize database connection and create tables"""
     global db_pool
     
@@ -193,27 +195,33 @@ async def init_database():
     
     try:
         # Create connection pool
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        db_pool = SimpleConnectionPool(1, 10, DATABASE_URL)
         
         # Create tables
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS alerts (
-                    id SERIAL PRIMARY KEY,
-                    alert_data JSONB NOT NULL,
-                    headline TEXT,
-                    category TEXT,
-                    source TEXT,
-                    detected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Create index for faster queries
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_alerts_detected_at 
-                ON alerts(detected_at DESC)
-            """)
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id SERIAL PRIMARY KEY,
+                alert_data JSONB NOT NULL,
+                headline TEXT,
+                category TEXT,
+                source TEXT,
+                detected_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create index for faster queries
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_alerts_detected_at 
+            ON alerts(detected_at DESC)
+        """)
+        
+        conn.commit()
+        cursor.close()
+        db_pool.putconn(conn)
         
         print("✅ Database initialized successfully")
         
@@ -222,48 +230,60 @@ async def init_database():
         db_pool = None
 
 
-async def save_alert_to_db(alert: Dict[str, Any]):
+def save_alert_to_db(alert: Dict[str, Any]):
     """Save alert to PostgreSQL"""
     if not db_pool:
         return
     
     try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        
         event = alert.get('event', {})
         
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO alerts (alert_data, headline, category, source, detected_at)
-                VALUES ($1, $2, $3, $4, $5)
-            """, 
-                json.dumps(alert),
-                event.get('headline', ''),
-                event.get('category', 'general'),
-                event.get('source', 'unknown'),
-                event.get('detected_at', datetime.now().isoformat())
-            )
+        cursor.execute("""
+            INSERT INTO alerts (alert_data, headline, category, source, detected_at)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (
+            Json(alert),
+            event.get('headline', ''),
+            event.get('category', 'general'),
+            event.get('source', 'unknown'),
+            event.get('detected_at', datetime.now().isoformat())
+        ))
         
-        print(f"💾 Saved alert to database")
+        conn.commit()
+        cursor.close()
+        db_pool.putconn(conn)
+        
+        print(f"💾 Saved alert to Supabase database")
         
     except Exception as e:
         print(f"❌ Error saving alert to database: {e}")
 
 
-async def load_alerts_from_db(limit: int = MAX_ALERTS) -> List[Dict[str, Any]]:
+def load_alerts_from_db(limit: int = MAX_ALERTS) -> List[Dict[str, Any]]:
     """Load recent alerts from PostgreSQL"""
     if not db_pool:
         return []
     
     try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT alert_data 
-                FROM alerts 
-                ORDER BY detected_at DESC 
-                LIMIT $1
-            """, limit)
+        conn = db_pool.getconn()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cursor.execute("""
+            SELECT alert_data 
+            FROM alerts 
+            ORDER BY detected_at DESC 
+            LIMIT %s
+        """, (limit,))
+        
+        rows = cursor.fetchall()
+        cursor.close()
+        db_pool.putconn(conn)
         
         alerts = [dict(row['alert_data']) for row in rows]
-        print(f"📂 Loaded {len(alerts)} alerts from database")
+        print(f"📂 Loaded {len(alerts)} alerts from Supabase database")
         return alerts
         
     except Exception as e:
@@ -271,20 +291,24 @@ async def load_alerts_from_db(limit: int = MAX_ALERTS) -> List[Dict[str, Any]]:
         return []
 
 
-async def cleanup_old_alerts():
+def cleanup_old_alerts():
     """Remove alerts older than 7 days to keep database clean"""
     if not db_pool:
         return
     
     try:
-        async with db_pool.acquire() as conn:
-            result = await conn.execute("""
-                DELETE FROM alerts 
-                WHERE detected_at < NOW() - INTERVAL '7 days'
-            """)
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
         
-        # Extract number of deleted rows from result
-        deleted = int(result.split()[-1]) if result else 0
+        cursor.execute("""
+            DELETE FROM alerts 
+            WHERE detected_at < NOW() - INTERVAL '7 days'
+        """)
+        
+        deleted = cursor.rowcount
+        conn.commit()
+        cursor.close()
+        db_pool.putconn(conn)
         
         if deleted > 0:
             print(f"🗑️  Cleaned up {deleted} old alerts from database")
@@ -477,13 +501,13 @@ async def process_news_item(headline: str, source: str):
         analysis["event"]["detected_at"] = datetime.now().isoformat()
         
         # Save to database
-        await save_alert_to_db(analysis)
+        save_alert_to_db(analysis)
         
         # Send to Telegram
         await send_telegram_alert(analysis, source)
         
         # Reload from database to keep in sync
-        recent_events = await load_alerts_from_db(MAX_ALERTS)
+        recent_events = load_alerts_from_db(MAX_ALERTS)
         
         print(f"✅ Processed {source} news: {headline[:60]}...")
         
@@ -509,7 +533,7 @@ async def monitor_cnbc_rss():
         "Accept": "application/rss+xml, application/xml, text/xml, */*",
     }
     
-    print(f"🚀 Starting CNBC monitor - Alerts persist in PostgreSQL...")
+    print(f"🚀 Starting CNBC monitor - Alerts persist in Supabase PostgreSQL...")
     
     while cnbc_monitor_running:
         try:
@@ -554,17 +578,17 @@ async def startup_event():
     global recent_events
     
     # Initialize database
-    await init_database()
+    init_database()
     
     # Load existing alerts from database
-    recent_events = await load_alerts_from_db(MAX_ALERTS)
+    recent_events = load_alerts_from_db(MAX_ALERTS)
     
     # Clean up old alerts
-    await cleanup_old_alerts()
+    cleanup_old_alerts()
     
     # Start CNBC monitor
     asyncio.create_task(monitor_cnbc_rss())
-    print(f"✅ System started - {len(recent_events)} alerts loaded from PostgreSQL")
+    print(f"✅ System started - {len(recent_events)} alerts loaded from Supabase PostgreSQL")
 
 
 @app.on_event("shutdown")
@@ -573,14 +597,14 @@ async def shutdown_event():
     cnbc_monitor_running = False
     
     if db_pool:
-        await db_pool.close()
+        db_pool.closeall()
     
     print("⏹️  System shut down")
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": f"Market Impact API - {len(recent_events)} alerts in database"}
+    return {"status": "ok", "message": f"Market Impact API - {len(recent_events)} alerts in Supabase"}
 
 
 @app.get("/health")
@@ -592,8 +616,8 @@ async def health():
         "database_configured": bool(db_pool),
         "cnbc_monitor_active": cnbc_monitor_running,
         "alerts_count": len(recent_events),
-        "storage": "PostgreSQL" if db_pool else "In-Memory (No Persistence!)",
-        "mode": "POSTGRESQL_ASYNCPG_WITH_REALTIME_DATA"
+        "storage": "Supabase PostgreSQL" if db_pool else "In-Memory (No Persistence!)",
+        "mode": "SUPABASE_POSTGRESQL_PERSISTENT_WITH_REALTIME_DATA"
     }
 
 
@@ -626,14 +650,14 @@ async def get_alerts():
     return {
         "alerts": recent_events,
         "count": len(recent_events),
-        "storage": "PostgreSQL" if db_pool else "In-Memory"
+        "storage": "Supabase PostgreSQL" if db_pool else "In-Memory"
     }
 
 
 @app.post("/api/test-alert")
 async def test_alert(news: NewsEvent):
     await process_news_item(news.text, news.source)
-    return {"status": "processed", "message": f"Alert saved to database"}
+    return {"status": "processed", "message": f"Alert saved to Supabase database"}
 
 
 if __name__ == "__main__":
