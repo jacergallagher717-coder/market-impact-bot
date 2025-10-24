@@ -30,8 +30,8 @@ app.add_middleware(
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = "claude-sonnet-4-5-20250929"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = "o1-preview"  # or "o1-mini" for faster/cheaper
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 MAX_ALERTS = 15
@@ -345,49 +345,49 @@ def find_relevant_playbooks(text: str, top_k: int = 3) -> List[Dict[str, Any]]:
     return matches[:top_k]
 
 
-async def call_anthropic_agent(news_text: str, playbook_context: str) -> Dict[str, Any]:
-    if not ANTHROPIC_API_KEY:
+async def call_openai_agent(news_text: str, playbook_context: str) -> Dict[str, Any]:
+    if not OPENAI_API_KEY:
         return create_fallback_analysis(news_text)
     
     # Get enriched market data with real-time prices, news, and context
     print("🔍 Fetching real-time market data...")
     enriched_context = await get_enriched_context(news_text)
     
-    # Build enhanced system prompt with real-time data
+    # Build enhanced prompt with real-time data
     enhanced_playbook = f"{playbook_context}\n\n{enriched_context}"
-    system_prompt = AGENT_SYSTEM_PROMPT.format(playbook_context=enhanced_playbook)
+    full_prompt = AGENT_SYSTEM_PROMPT.format(playbook_context=enhanced_playbook)
+    full_prompt += f"\n\nAnalyze this breaking news and provide multiple trade ideas in the same direction: {news_text}"
     
-    async with httpx.AsyncClient(timeout=45.0) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:  # o1 needs more time for thinking
         try:
             response = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                "https://api.openai.com/v1/chat/completions",
                 headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
                 },
                 json={
-                    "model": ANTHROPIC_MODEL,
-                    "max_tokens": 4096,
-                    "system": system_prompt,
-                    "messages": [{"role": "user", "content": f"Analyze this breaking news and provide multiple trade ideas in the same direction: {news_text}"}]
+                    "model": OPENAI_MODEL,
+                    "messages": [
+                        {"role": "user", "content": full_prompt}
+                    ]
                 }
             )
             response.raise_for_status()
             
             result = response.json()
-            content = result["content"][0]["text"]
+            content = result["choices"][0]["message"]["content"]
             
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0]
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0]
             
-            print("✅ Analysis complete with real-time data")
+            print("✅ Analysis complete with OpenAI o1 reasoning")
             return json.loads(content.strip())
             
         except Exception as e:
-            print(f"Anthropic API error: {e}")
+            print(f"OpenAI API error: {e}")
             return create_fallback_analysis(news_text)
 
 
@@ -496,7 +496,7 @@ async def process_news_item(headline: str, source: str):
             for p in playbooks
         ) if playbooks else "General market news - identify multiple trade opportunities in the same direction"
         
-        analysis = await call_anthropic_agent(headline, playbook_context)
+        analysis = await call_openai_agent(headline, playbook_context)
         analysis["event"]["source"] = source
         analysis["event"]["detected_at"] = datetime.now().isoformat()
         
@@ -612,12 +612,12 @@ async def health():
     return {
         "status": "healthy",
         "telegram_configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
-        "anthropic_configured": bool(ANTHROPIC_API_KEY),
+        "openai_configured": bool(OPENAI_API_KEY),
         "database_configured": bool(db_pool),
         "cnbc_monitor_active": cnbc_monitor_running,
         "alerts_count": len(recent_events),
         "storage": "Supabase PostgreSQL" if db_pool else "In-Memory (No Persistence!)",
-        "mode": "SUPABASE_POSTGRESQL_PERSISTENT_WITH_REALTIME_DATA"
+        "mode": "SUPABASE_POSTGRESQL_OPENAI_O1_REASONING"
     }
 
 
