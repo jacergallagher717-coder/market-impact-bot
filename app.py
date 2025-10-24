@@ -31,7 +31,7 @@ app.add_middleware(
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = "o1-preview"  # or "o1-mini" for faster/cheaper
+OPENAI_MODEL = "gpt-4o"  # GPT-4o - smart and fast
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 MAX_ALERTS = 15
@@ -355,10 +355,9 @@ async def call_openai_agent(news_text: str, playbook_context: str) -> Dict[str, 
     
     # Build enhanced prompt with real-time data
     enhanced_playbook = f"{playbook_context}\n\n{enriched_context}"
-    full_prompt = AGENT_SYSTEM_PROMPT.format(playbook_context=enhanced_playbook)
-    full_prompt += f"\n\nAnalyze this breaking news and provide multiple trade ideas in the same direction: {news_text}"
+    system_prompt = AGENT_SYSTEM_PROMPT.format(playbook_context=enhanced_playbook)
     
-    async with httpx.AsyncClient(timeout=120.0) as client:  # o1 needs more time for thinking
+    async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -369,8 +368,10 @@ async def call_openai_agent(news_text: str, playbook_context: str) -> Dict[str, 
                 json={
                     "model": OPENAI_MODEL,
                     "messages": [
-                        {"role": "user", "content": full_prompt}
-                    ]
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Analyze this breaking news and provide multiple trade ideas in the same direction: {news_text}"}
+                    ],
+                    "temperature": 0.7
                 }
             )
             response.raise_for_status()
@@ -383,7 +384,7 @@ async def call_openai_agent(news_text: str, playbook_context: str) -> Dict[str, 
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0]
             
-            print("✅ Analysis complete with OpenAI o1 reasoning")
+            print("✅ Analysis complete with GPT-4o")
             return json.loads(content.strip())
             
         except Exception as e:
