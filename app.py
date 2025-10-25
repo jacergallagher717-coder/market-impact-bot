@@ -17,8 +17,10 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from psycopg2.pool import SimpleConnectionPool
 from market_enricher import get_enriched_context
+from news_filter import should_send_alert, log_filter_decision, calculate_news_quality_score
+from elite_prompt import get_elite_prompt_with_context
 
-app = FastAPI(title="Market Impact API")
+app = FastAPI(title="Market Impact API - ELITE EDITION")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +36,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "gpt-4o"  # GPT-4o - smart and fast
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-MAX_ALERTS = 15
+MAX_ALERTS = 15  # Keep last 15 in database for display
+DAILY_ALERT_LIMIT = 10  # Maximum 10 HIGH-QUALITY alerts per day
 
 # Database connection pool
 db_pool = None
@@ -99,83 +102,8 @@ PLAYBOOK = {
     }
 }
 
-AGENT_SYSTEM_PROMPT = """You are a real-time market impact analyst and trade ideation engine.
+# Agent system prompt is now in elite_prompt.py module
 
-Given breaking news, you must:
-1. Determine the PRIMARY market direction (bullish or bearish)
-2. Generate 3-5 SPECIFIC trade ideas in that SAME direction with different tickers
-3. Explain why it matters (3-5 bullet points)
-4. Provide bull/bear/base case scenarios with affected assets
-
-PLAYBOOK KNOWLEDGE:
-{playbook_context}
-
-OUTPUT: Valid JSON matching this schema:
-{{
-  "event": {{
-    "headline": "concise headline",
-    "category": "macro|commodity|sector",
-    "confidence": 0.0-1.0,
-    "detected_at": "ISO timestamp",
-    "primary_direction": "bullish|bearish"
-  }},
-  "why_it_matters": ["point 1", "point 2", "point 3"],
-  "trade_ideas": [
-    {{
-      "ticker": "SYMBOL",
-      "direction": "bullish|bearish",
-      "strategy": "shares|calls|puts|spread",
-      "rationale": "why this specific trade",
-      "conviction": "high|medium|low",
-      "entry_price": "specific entry price or range like '245-248'",
-      "target_price": "price target like '275'",
-      "stop_loss": "stop loss price like '235'",
-      "time_horizon": "holding period like '2-4 weeks' or '1-3 months'",
-      "risk_reward_ratio": "ratio like '1:3' or '1:2.5'"
-    }}
-  ],
-  "scenarios": {{
-    "bull_case": {{
-      "description": "What happens in best case scenario",
-      "probability": "percentage like 30%",
-      "affected_assets": [
-        {{"ticker": "SYMBOL", "impact": "up|down", "magnitude": "strong|moderate|weak"}}
-      ]
-    }},
-    "bear_case": {{
-      "description": "What happens in worst case scenario",
-      "probability": "percentage like 20%",
-      "affected_assets": [
-        {{"ticker": "SYMBOL", "impact": "up|down", "magnitude": "strong|moderate|weak"}}
-      ]
-    }},
-    "base_case": {{
-      "description": "Most likely outcome",
-      "probability": "percentage like 50%",
-      "affected_assets": [
-        {{"ticker": "SYMBOL", "impact": "up|down", "magnitude": "strong|moderate|weak"}}
-      ]
-    }}
-  }}
-}}
-
-CRITICAL TRADING PARAMETERS:
-- Use REAL-TIME DATA provided to calculate accurate entry/exit prices
-- Entry price should be near current price (within 2-5% for shares, 10-15% for options)
-- Target price should be realistic based on technical levels and fundamentals
-- Stop loss should limit risk to 3-8% for shares, 25-50% for options
-- Risk/reward ratio should be at least 1:2 (risk $1 to make $2+)
-- Time horizon should match catalyst timing (earnings = 2-4 weeks, macro = 2-6 months)
-
-IMPORTANT: 
-- Generate 3-5 trade ideas ALL IN THE SAME DIRECTION (all bullish OR all bearish)
-- Each trade idea should be a DIFFERENT ticker with unique rationale
-- If news is bullish for sector, give multiple bullish stock ideas in that sector
-- If news is bearish, give multiple bearish plays (puts, shorts, inverse ETFs)
-- Order trade ideas by conviction (highest first)
-- ALWAYS include specific entry, target, and stop loss prices using real-time data
-
-Output ONLY valid JSON."""
 
 
 class NewsEvent(BaseModel):
@@ -353,9 +281,9 @@ async def call_openai_agent(news_text: str, playbook_context: str) -> Dict[str, 
     print("🔍 Fetching real-time market data...")
     enriched_context = await get_enriched_context(news_text)
     
-    # Build enhanced prompt with real-time data
+    # Build enhanced prompt with real-time data using ELITE prompt system
     enhanced_playbook = f"{playbook_context}\n\n{enriched_context}"
-    system_prompt = AGENT_SYSTEM_PROMPT.format(playbook_context=enhanced_playbook)
+    system_prompt = get_elite_prompt_with_context(enhanced_playbook)
     
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
@@ -369,7 +297,7 @@ async def call_openai_agent(news_text: str, playbook_context: str) -> Dict[str, 
                     "model": OPENAI_MODEL,
                     "messages": [
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Analyze this breaking news and provide multiple trade ideas in the same direction: {news_text}"}
+                        {"role": "user", "content": f"Analyze this breaking news with ELITE institutional-level insight: {news_text}"}
                     ],
                     "temperature": 0.7
                 }
@@ -384,7 +312,7 @@ async def call_openai_agent(news_text: str, playbook_context: str) -> Dict[str, 
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0]
             
-            print("✅ Analysis complete with GPT-4o")
+            print("✅ Elite analysis complete with GPT-4o")
             return json.loads(content.strip())
             
         except Exception as e:
@@ -483,7 +411,7 @@ _Not financial advice._"""
 
 
 async def process_news_item(headline: str, source: str):
-    """Process news and save to database"""
+    """Process news with ELITE FILTERING - only high-quality alerts"""
     global recent_events
     try:
         event_hash = hash_event(headline)
@@ -497,20 +425,34 @@ async def process_news_item(headline: str, source: str):
             for p in playbooks
         ) if playbooks else "General market news - identify multiple trade opportunities in the same direction"
         
+        # Generate analysis
         analysis = await call_openai_agent(headline, playbook_context)
         analysis["event"]["source"] = source
         analysis["event"]["detected_at"] = datetime.now().isoformat()
         
-        # Save to database
+        # SMART FILTER: Check if alert meets quality threshold
+        should_send, rejection_reason = should_send_alert(headline, analysis)
+        
+        if not should_send:
+            # Log why it was filtered
+            log_filter_decision(headline, analysis, sent=False, reason=rejection_reason)
+            return  # Don't save or send low-quality alerts
+        
+        # Calculate quality score for logging
+        quality_score = calculate_news_quality_score(headline, analysis)
+        
+        # Save to database (only high-quality alerts)
         save_alert_to_db(analysis)
         
-        # Send to Telegram
+        # Send to Telegram (only high-quality alerts)
         await send_telegram_alert(analysis, source)
         
         # Reload from database to keep in sync
         recent_events = load_alerts_from_db(MAX_ALERTS)
         
-        print(f"✅ Processed {source} news: {headline[:60]}...")
+        # Log successful send with quality metrics
+        log_filter_decision(headline, analysis, sent=True)
+        print(f"✅ Processed {source} news (Quality: {quality_score:.1%}): {headline[:60]}...")
         
     except Exception as e:
         print(f"Error processing news: {e}")
@@ -614,11 +556,14 @@ async def health():
         "status": "healthy",
         "telegram_configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
         "openai_configured": bool(OPENAI_API_KEY),
+        "alpha_vantage_configured": bool(os.getenv("ALPHA_VANTAGE_API_KEY")),
         "database_configured": bool(db_pool),
         "cnbc_monitor_active": cnbc_monitor_running,
         "alerts_count": len(recent_events),
         "storage": "Supabase PostgreSQL" if db_pool else "In-Memory (No Persistence!)",
-        "mode": "SUPABASE_POSTGRESQL_OPENAI_O1_REASONING"
+        "mode": "🔥 ELITE_EDITION - Smart Filter + GPT-4o + Alpha Vantage + Supabase",
+        "daily_alert_limit": DAILY_ALERT_LIMIT,
+        "filtering": "Enabled - Only high-quality, actionable alerts"
     }
 
 
