@@ -4,5 +4,5 @@ httpx
 psycopg2-binary
 python-multipart
 pydantic[email]
-pyjwt
+PyJWT
 bcrypt
