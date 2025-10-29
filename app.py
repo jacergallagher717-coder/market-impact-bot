@@ -263,14 +263,22 @@ def load_alerts_from_db(limit: int = MAX_ALERTS) -> List[Dict]:
     
     try:
         cursor.execute("""
-            SELECT alert_data FROM alerts
+            SELECT id, alert_data FROM alerts
             ORDER BY detected_at DESC
             LIMIT %s
         """, (limit,))
         
         rows = cursor.fetchall()
         print(f"📂 Loaded {len(rows)} alerts from Supabase database")
-        return [dict(row["alert_data"]) for row in rows]
+        
+        # Add the database ID to each alert
+        alerts = []
+        for row in rows:
+            alert_data = dict(row["alert_data"])
+            alert_data["id"] = row["id"]  # Add database ID
+            alerts.append(alert_data)
+        
+        return alerts
     except Exception as e:
         print(f"Error loading from database: {e}")
         return []
@@ -722,7 +730,7 @@ async def get_portfolio(current_user: dict = Depends(get_current_user)):
                 "alert_data": row[16]
             })
         
-        return {"portfolio": portfolio, "total": len(portfolio)}
+        return {"trades": portfolio, "total": len(portfolio)}
         
     finally:
         cursor.close()
@@ -980,7 +988,12 @@ async def get_user_performance(current_user: dict = Depends(get_current_user)):
 
 @app.get("/api/alerts")
 async def get_alerts():
-    return {"alerts": recent_events}
+    """Get alerts with database IDs included"""
+    if db_pool:
+        alerts_with_ids = load_alerts_from_db(MAX_ALERTS)
+        return {"alerts": alerts_with_ids}
+    else:
+        return {"alerts": recent_events}
 
 @app.post("/api/news")
 async def submit_news(event: NewsEvent, background_tasks: BackgroundTasks):
