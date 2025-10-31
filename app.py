@@ -1000,6 +1000,69 @@ async def submit_news(event: NewsEvent, background_tasks: BackgroundTasks):
     background_tasks.add_task(process_news_item, event.text, event.source)
     return {"status": "processing", "message": "News submitted for analysis"}
 
+# ==================== PRICE ENDPOINT ====================
+
+@app.get("/api/prices")
+async def get_stock_prices(tickers: str):
+    """
+    Get real-time stock prices for multiple tickers
+    Example: /api/prices?tickers=AAPL,MSFT,TSLA
+    """
+    ticker_list = [t.strip().upper() for t in tickers.split(',') if t.strip()]
+    
+    if not ticker_list:
+        raise HTTPException(status_code=400, detail="No tickers provided")
+    
+    prices = {}
+    
+    # Use Alpha Vantage API for real-time quotes
+    ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+    
+    if not ALPHA_VANTAGE_KEY:
+        # Fallback: return mock prices if no API key
+        for ticker in ticker_list:
+            prices[ticker] = {
+                "price": 100.0,
+                "change": 0.0,
+                "change_percent": 0.0,
+                "error": "No API key configured"
+            }
+        return {"prices": prices}
+    
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for ticker in ticker_list[:10]:  # Limit to 10 tickers per request
+            try:
+                url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}"
+                response = await client.get(url)
+                data = response.json()
+                
+                if "Global Quote" in data and data["Global Quote"]:
+                    quote = data["Global Quote"]
+                    prices[ticker] = {
+                        "price": float(quote.get("05. price", 0)),
+                        "change": float(quote.get("09. change", 0)),
+                        "change_percent": float(quote.get("10. change percent", "0").replace("%", "")),
+                        "volume": quote.get("06. volume", "0"),
+                        "updated_at": quote.get("07. latest trading day", "")
+                    }
+                else:
+                    prices[ticker] = {
+                        "price": 0.0,
+                        "change": 0.0,
+                        "change_percent": 0.0,
+                        "error": "Price not available"
+                    }
+                    
+            except Exception as e:
+                prices[ticker] = {
+                    "price": 0.0,
+                    "change": 0.0,
+                    "change_percent": 0.0,
+                    "error": str(e)
+                }
+    
+    return {"prices": prices}
+
 # ==================== HEALTH & ROOT ====================
 
 @app.get("/")
